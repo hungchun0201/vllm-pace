@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import json
+import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -46,9 +49,14 @@ class SimpleCPUOffloadWorker:
 
         self._backend = DmaCopyBackend()
 
-        # Ordered (event_idx, Event). Events pre-allocated on main thread.
-        self._load_events: list[tuple[int, torch.Event]] = []
-        self._store_events: list[tuple[int, torch.Event]] = []
+        # Ordered (event_idx, start_event, end_event, n_blocks, total_bytes,
+        # is_store). Timing events recorded by the copy backend thread.
+        self._load_events: list[
+            tuple[int, torch.Event, torch.Event, int, int, bool]
+        ] = []
+        self._store_events: list[
+            tuple[int, torch.Event, torch.Event, int, int, bool]
+        ] = []
         # High-water marks: highest event_idx completed per stream.
         # When the event list is empty, the hwm covers all prior events.
         self._load_hwm: int = -1
@@ -62,6 +70,17 @@ class SimpleCPUOffloadWorker:
         self._pending_store_event_indices: set[int] = set()
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
+
+        # Pending req_ids for DMA trace events
+        self._pending_store_req_ids: list[str] = []
+        self._pending_load_req_ids: list[str] = []
+
+        # DMA timing trace file (opt-in via SCHED_TRACE_PATH env var)
+        self._dma_trace_file = None
+        trace_path = os.environ.get("SCHED_TRACE_PATH")
+        if trace_path:
+            dma_path = f"{trace_path}.dma.jsonl"
+            self._dma_trace_file = open(dma_path, "a", buffering=1)
 
     def register_kv_caches(
         self,
@@ -227,6 +246,7 @@ class SimpleCPUOffloadWorker:
                     event_idx=metadata.load_event,
                     events_list=self._load_events,
                 )
+            self._pending_load_req_ids = metadata.load_req_ids
             # Launch stores (GPU->CPU).
             if metadata.store_gpu_blocks:
                 self._backend.launch_copy(
@@ -236,6 +256,8 @@ class SimpleCPUOffloadWorker:
                     event_idx=metadata.store_event,
                     events_list=self._store_events,
                 )
+
+            self._pending_store_req_ids = metadata.store_req_ids
 
         # (2) Track completed transfer events
         finished_recving: set[str] = set()
@@ -278,13 +300,13 @@ class SimpleCPUOffloadWorker:
 
     def _flush_and_sync_all(self) -> None:
         """Synchronize all in-flight transfer events."""
-        for event_idx, event in self._load_events:
-            event.synchronize()
+        for event_idx, _start, end, _nb, _tb, _s in self._load_events:
+            end.synchronize()
             self._load_hwm = event_idx
         self._load_events.clear()
 
-        for event_idx, event in self._store_events:
-            event.synchronize()
+        for event_idx, _start, end, _nb, _tb, _s in self._store_events:
+            end.synchronize()
             self._store_hwm = event_idx
         self._store_events.clear()
 
@@ -293,11 +315,36 @@ class SimpleCPUOffloadWorker:
         events = self._store_events if is_store else self._load_events
         hwm = self._store_hwm if is_store else self._load_hwm
         while events:
-            event_idx, event = events[0]
-            if not event.query():
+            event_idx, start_event, end_event, n_blocks, total_bytes, ev_store = events[0]
+            if not end_event.query():
                 break
             hwm = event_idx
             events.pop(0)
+            # Emit DMA timing trace
+            if self._dma_trace_file is not None:
+                elapsed_ms = start_event.elapsed_time(end_event)
+                bw_gbps = (
+                    total_bytes / elapsed_ms / 1e6
+                    if elapsed_ms > 0 else 0.0
+                )
+                req_ids = (
+                    self._pending_store_req_ids if ev_store
+                    else self._pending_load_req_ids
+                )
+                job_ids = list(set(
+                    rid.split("-t")[0] for rid in req_ids if "-t" in rid
+                ))
+                self._dma_trace_file.write(json.dumps({
+                    "event": "dma_transfer",
+                    "ts": time.time(),
+                    "direction": "store" if ev_store else "load",
+                    "n_blocks": n_blocks,
+                    "total_bytes": total_bytes,
+                    "elapsed_ms": round(elapsed_ms, 4),
+                    "bandwidth_gbps": round(bw_gbps, 4),
+                    "req_ids": req_ids,
+                    "job_ids": job_ids,
+                }) + "\n")
         if is_store:
             self._store_hwm = hwm
         else:

@@ -359,6 +359,8 @@ class SimpleCPUOffloadScheduler:
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
+            store_req_ids=store_req_ids,
+            load_req_ids=load_req_ids,
             need_flush=bool(scheduler_output.preempted_req_ids),
         )
         return result

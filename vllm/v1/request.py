@@ -73,6 +73,8 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        job_id: str | None = None,
+        is_last_step: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -176,12 +178,35 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        # Continuum scheduling: multi-turn job identity and step position.
+        # job_id groups all turns of an agentic job so their KV blocks can be
+        # pinned across tool-call gaps.  is_last_step marks the final turn so
+        # the scheduler knows when to release the pinned blocks.
+        self.job_id: str | None = job_id
+        self.is_last_step: bool = is_last_step
+        # Populated by ToolCallEstimator after the request finishes.
+        # this_func_call := first word of the bash command in the LLM output
+        #                   (or None if no single-bash-block action detected)
+        # last_func_call := the tool call from the previous turn of this job
+        self.this_func_call: str | None = None
+        self.last_func_call: str | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
+        # Extract Continuum fields from sampling_params.extra_args if present.
+        extra_args: dict[str, Any] | None = (
+            request.sampling_params.extra_args
+            if request.sampling_params is not None
+            else None
+        )
+        job_id: str | None = extra_args.get("job_id") if extra_args else None
+        is_last_step: bool = (
+            bool(extra_args.get("is_last_step", False)) if extra_args else False
+        )
         return cls(
             request_id=request.request_id,
             client_index=request.client_index,
@@ -198,6 +223,8 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            job_id=job_id,
+            is_last_step=is_last_step,
         )
 
     def append_output_token_ids(

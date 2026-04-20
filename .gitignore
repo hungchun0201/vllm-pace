@@ -241,3 +241,9 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Local experiment artefacts (added by pace-local backup)
+/build_logs/
+/results/
+
+/pace/

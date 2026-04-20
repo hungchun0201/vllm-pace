@@ -34,6 +34,10 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     store_gpu_blocks: list[int] = field(default_factory=list)
     store_cpu_blocks: list[int] = field(default_factory=list)
 
+    # Request identities for DMA trace events (scheduler -> worker).
+    store_req_ids: list[str] = field(default_factory=list)
+    load_req_ids: list[str] = field(default_factory=list)
+
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
 

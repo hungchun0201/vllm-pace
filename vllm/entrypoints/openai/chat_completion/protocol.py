@@ -337,6 +337,23 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
+    job_id: str | None = Field(
+        default=None,
+        description=(
+            "Continuum scheduling: opaque identifier that groups multiple "
+            "chat-completion requests into a single agentic job so their "
+            "KV-cache blocks can be pinned across tool-call gaps."
+        ),
+    )
+    is_last_step: bool = Field(
+        default=False,
+        description=(
+            "Continuum scheduling: set to True on the final turn of an "
+            "agentic job so the scheduler frees (instead of pinning) the "
+            "KV-cache blocks when the request finishes."
+        ),
+    )
+
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(
@@ -490,6 +507,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        # Continuum scheduling fields
+        if self.job_id is not None:
+            extra_args["job_id"] = self.job_id
+        if self.is_last_step:
+            extra_args["is_last_step"] = True
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
