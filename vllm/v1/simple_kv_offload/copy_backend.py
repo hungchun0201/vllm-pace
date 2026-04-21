@@ -7,6 +7,7 @@ from __future__ import annotations
 import queue
 import threading
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -90,8 +91,15 @@ class DmaCopyBackend:
             if item is None:
                 return
             src_blocks, dst_blocks, params, is_store, event_idx, events_list = item
-            copy_blocks(src_blocks, dst_blocks, params)
             stream = store_stream if is_store else load_stream
-            event = torch.Event()
-            event.record(stream)
-            events_list.append((event_idx, event))
+            n_blocks = len(src_blocks)
+            total_bytes = int(n_blocks * np.sum(params.bpb))
+            start_event = torch.Event(enable_timing=True)
+            start_event.record(stream)
+            copy_blocks(src_blocks, dst_blocks, params)
+            end_event = torch.Event(enable_timing=True)
+            end_event.record(stream)
+            events_list.append(
+                (event_idx, start_event, end_event,
+                 n_blocks, total_bytes, is_store)
+            )

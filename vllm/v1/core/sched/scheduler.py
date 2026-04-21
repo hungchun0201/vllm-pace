@@ -50,6 +50,8 @@ from vllm.v1.core.sched.request_queue import (
     SchedulingPolicy,
     create_request_queue,
 )
+from vllm.v1.core.sched import trace as sched_trace
+from vllm.v1.core.estimate_with_func import ToolCallEstimator
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
@@ -164,6 +166,7 @@ class Scheduler(SchedulerInterface):
             ) from e
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
+        self._sched_step_counter: int = 0
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
@@ -295,6 +298,81 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+        # Continuum: track requests whose KV blocks are pinned across
+        # tool-call gaps.  Each entry is (request, unpin_wall_clock_time).
+        self.pinned_requests: list[tuple[Request, float]] = []
+        # Continuum: tool-call execution time predictor for dynamic pin TTL.
+        # Only instantiated when policy == CONTINUUM to avoid the tokenizer
+        # load cost on other scheduling modes.
+        self.tool_call_estimator: ToolCallEstimator | None = None
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            mc = self.vllm_config.model_config
+            model_name = (
+                getattr(mc, "tokenizer", None)
+                or getattr(mc, "model", None)
+                or getattr(mc, "served_model_name", None)
+            )
+            try:
+                self.tool_call_estimator = ToolCallEstimator(model_name=model_name)
+            except Exception as e:
+                logger.warning(
+                    "Continuum: failed to init ToolCallEstimator (%s); falling back "
+                    "to no-pin mode.", e,
+                )
+                self.tool_call_estimator = ToolCallEstimator(model_name=None)
+
+    # ------------------------------------------------------------------
+    # Continuum scheduling helpers
+    # ------------------------------------------------------------------
+
+    def _pin_request(self, request: Request, pin_ttl: float = 10.0) -> None:
+        """Pin request's KV blocks in VRAM for pin_ttl seconds.
+
+        Called at the end of a non-final agent turn so the next turn can
+        reuse the cached KV state without recomputing from scratch.
+
+        Evict any stale pin for the same job_id first so each job holds at
+        most one pinned turn at a time. Shared prefix blocks are refcounted,
+        so freeing the previous pin decrements without losing reusable KV.
+        """
+        if getattr(request, "job_id", None):
+            stale = [
+                (r, t)
+                for r, t in self.pinned_requests
+                if getattr(r, "job_id", None) == request.job_id
+            ]
+            for r, t in stale:
+                self._unpin_request(r, t)
+        self.pinned_requests.append((request, time.time() + pin_ttl))
+
+    def _unpin_request(self, request: Request, end_time: float) -> None:
+        """Unpin and free a request's KV blocks.
+
+        Removes the pin entry, releases the KV cache blocks, and deletes the
+        request from the live request map.
+        """
+        self.pinned_requests.remove((request, end_time))
+        self.kv_cache_manager.free(request)
+        del self.requests[request.request_id]
+
+    def _unpin_expired_requests(self) -> None:
+        """Free KV blocks for all pinned requests whose TTL has elapsed.
+
+        Called at the very start of each schedule() step so expired pinned
+        requests do not hold VRAM indefinitely.
+        """
+        now = time.time()
+        expired = [(req, t) for req, t in self.pinned_requests if now >= t]
+        for req, t in expired:
+            logger.debug(
+                "Continuum: unpinning expired request %s (job_id=%s)",
+                req.request_id,
+                req.job_id,
+            )
+            self._unpin_request(req, t)
+
+    # ------------------------------------------------------------------
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -357,6 +435,16 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # Continuum: release KV blocks for any pinned requests that have
+        # exceeded their time-to-live, then inform the waiting queue which
+        # job_ids are still warm in VRAM so it can prioritise them.
+        if self.policy == SchedulingPolicy.CONTINUUM:
+            self._unpin_expired_requests()
+            if hasattr(self.waiting, "update_pinned_state"):
+                self.waiting.update_pinned_state(
+                    {req.job_id for req, _ in self.pinned_requests if req.job_id}
+                )
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -379,6 +467,59 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        if sched_trace.enabled():
+            try:
+                free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            except AttributeError:
+                free_blocks = None
+            try:
+                gpu_cached_blocks = len(
+                    self.kv_cache_manager.block_pool.cached_block_hash_to_block
+                )
+            except Exception:
+                gpu_cached_blocks = None
+            # Probe CPU offload connector (SimpleCPUOffloadConnector) for CPU tier stats.
+            cpu_free_blocks = None
+            cpu_total_blocks = None
+            cpu_cached_blocks = None
+            if self.connector is not None:
+                sm = getattr(self.connector, "scheduler_manager", None)
+                cbp = getattr(sm, "cpu_block_pool", None) if sm is not None else None
+                if cbp is not None:
+                    try:
+                        cpu_free_blocks = cbp.get_num_free_blocks()
+                    except Exception:
+                        cpu_free_blocks = None
+                    try:
+                        cpu_cached_blocks = len(cbp.cached_block_hash_to_block)
+                    except Exception:
+                        cpu_cached_blocks = None
+                    cpu_total_blocks = getattr(sm, "num_cpu_blocks", None)
+            pinned_blocks = 0
+            for req, _ in self.pinned_requests:
+                try:
+                    bids = self.kv_cache_manager.get_block_ids(req.request_id)
+                    pinned_blocks += sum(len(g) for g in bids)
+                except Exception:
+                    pass
+            sched_trace.step_snapshot(
+                step=self._sched_step_counter,
+                running=self.running,
+                waiting=self.waiting,
+                free_blocks=free_blocks,
+                total_blocks=self.cache_config.num_gpu_blocks,
+                gpu_cached_blocks=gpu_cached_blocks,
+                cpu_free_blocks=cpu_free_blocks,
+                cpu_total_blocks=cpu_total_blocks,
+                cpu_cached_blocks=cpu_cached_blocks,
+                num_pinned=len(self.pinned_requests),
+                pinned_blocks=pinned_blocks,
+                pinned_job_ids=[req.job_id for req, _ in self.pinned_requests if req.job_id],
+                max_num_running_reqs=self.max_num_running_reqs,
+                max_num_scheduled_tokens=self.max_num_scheduled_tokens,
+            )
+        self._sched_step_counter += 1
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -496,6 +637,25 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
+                    elif self.policy == SchedulingPolicy.CONTINUUM:
+                        # Continuum: prefer to preempt requests that do NOT
+                        # belong to a pinned job, preserving warm KV blocks.
+                        pinned_job_ids = {
+                            req.job_id
+                            for req, _ in self.pinned_requests
+                            if req.job_id
+                        }
+                        unpinned = [
+                            r
+                            for r in self.running
+                            if getattr(r, "job_id", None) not in pinned_job_ids
+                        ]
+                        if unpinned:
+                            preempted_req = unpinned[-1]
+                            self.running.remove(preempted_req)
+                        else:
+                            # No unpinned candidates; fall back to FCFS order.
+                            preempted_req = self.running.pop()
                     else:
                         preempted_req = self.running.pop()
 
@@ -642,6 +802,19 @@ class Scheduler(SchedulerInterface):
                         num_new_local_computed_tokens + num_external_computed_tokens
                     )
                     assert num_computed_tokens <= request.num_tokens
+
+                    if sched_trace.enabled():
+                        sched_trace.prefix_cache_event(
+                            step=self._sched_step_counter - 1,
+                            req_id=request.request_id,
+                            job_id=getattr(request, "job_id", None),
+                            local_hit_tokens=num_new_local_computed_tokens,
+                            external_hit_tokens=num_external_computed_tokens,
+                            total_prompt_tokens=request.num_prompt_tokens,
+                            num_tokens=request.num_tokens,
+                            connector_name=type(self.connector).__name__ if self.connector is not None else None,
+                            load_kv_async=load_kv_async,
+                        )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0
                     # after async KV recvs are completed.
@@ -946,6 +1119,19 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        if sched_trace.enabled():
+            # _sched_step_counter was incremented after the snapshot; the
+            # decision applies to the SAME logical step, so subtract 1.
+            sched_trace.step_decision(
+                step=self._sched_step_counter - 1,
+                scheduled_new_req_ids=[r.request_id for r in scheduled_new_reqs],
+                scheduled_resumed_req_ids=[r.request_id for r in scheduled_resumed_reqs],
+                scheduled_running_req_ids=[r.request_id for r in scheduled_running_reqs],
+                preempted_req_ids=[r.request_id for r in preempted_reqs],
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_scheduled_tokens=total_num_scheduled_tokens,
+            )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1747,6 +1933,11 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            if (
+                self.policy == SchedulingPolicy.CONTINUUM
+                and self.tool_call_estimator is not None
+            ):
+                self.tool_call_estimator.request_arrives(request)
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
@@ -1821,6 +2012,34 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+
+        # Continuum: for non-final turns of a multi-step agentic job, consult
+        # the tool-call estimator to decide whether pinning the KV blocks is
+        # worthwhile.  set_up_pin() returns 0 when the predicted tool-call
+        # exec time exceeds FIXED_THRESHOLD_CONTINUUM (2.0s), in which case
+        # the next turn won't arrive in time to reuse the pin — so we free
+        # blocks immediately like FCFS would.
+        if (
+            self.policy == SchedulingPolicy.CONTINUUM
+            and not request.is_last_step
+            and request.job_id
+            and self.tool_call_estimator is not None
+        ):
+            self.tool_call_estimator.request_finished(request)
+            pin_ttl = self.tool_call_estimator.set_up_pin(request)
+            if pin_ttl > 0.0:
+                self.encoder_cache_manager.free(request)
+                request_id = request.request_id
+                self.finished_req_ids.add(request_id)
+                if self.finished_req_ids_dict is not None:
+                    self.finished_req_ids_dict[request.client_index].add(request_id)
+                self._pin_request(request, pin_ttl=pin_ttl)
+                logger.debug(
+                    "Continuum: pinning request %s (job_id=%s) for %.2fs",
+                    request.request_id, request.job_id, pin_ttl,
+                )
+                return kv_xfer_params
+
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)

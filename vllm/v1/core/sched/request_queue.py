@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -15,6 +16,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    CONTINUUM = "continuum"
 
 
 class RequestQueue(ABC):
@@ -198,11 +200,120 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
+class ContinuumRequestQueue(deque[Request], RequestQueue):
+    """A job-aware FCFS queue for the Continuum scheduling policy.
+
+    Continuum pins KV-cache blocks across multi-turn agent tool-call gaps.
+    Within a scheduling step the queue prefers requests whose ``job_id`` is
+    already pinned in VRAM (so their blocks stay warm).  Among unpinned jobs
+    the request whose job was first seen is returned next (job-level FCFS).
+
+    The scheduler calls ``update_pinned_state()`` once per step to tell the
+    queue which job_ids are currently pinned.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pinned_job_ids: set[str] = set()
+        self.job_id_first_entry_time: dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # Pinning state (updated by Scheduler each step)
+    # ------------------------------------------------------------------
+
+    def update_pinned_state(self, pinned_job_ids: set[str]) -> None:
+        """Refresh the set of job_ids whose blocks are pinned in VRAM."""
+        self._pinned_job_ids = pinned_job_ids
+
+    # ------------------------------------------------------------------
+    # RequestQueue interface
+    # ------------------------------------------------------------------
+
+    def add_request(self, request: Request) -> None:
+        """Add a request; record first-entry time for its job."""
+        job_id = getattr(request, "job_id", None)
+        if job_id is not None and job_id not in self.job_id_first_entry_time:
+            self.job_id_first_entry_time[job_id] = time.time()
+        self.append(request)
+
+    def pop_request(self) -> Request:
+        """Pop the highest-priority request according to Continuum order."""
+        if not self:
+            raise IndexError("pop from an empty queue")
+        req = self.peek_request()
+        self.remove(req)
+        return req
+
+    def peek_request(self) -> Request:
+        """Return (without removing) the next request to be scheduled.
+
+        Priority order:
+        1. Requests whose job_id is pinned (earliest pinned job first).
+        2. All other requests ordered by job first-entry time (FCFS per job).
+        """
+        if not self:
+            raise IndexError("peek from an empty queue")
+
+        # Collect pinned candidates
+        pinned: list[Request] = [
+            r for r in self if getattr(r, "job_id", None) in self._pinned_job_ids
+        ]
+        if pinned:
+            # Return the request belonging to the earliest-pinned job.
+            return min(
+                pinned,
+                key=lambda r: self.job_id_first_entry_time.get(
+                    getattr(r, "job_id", ""), float("inf")
+                ),
+            )
+
+        # No pinned candidates — standard job-level FCFS.
+        return min(
+            self,
+            key=lambda r: self.job_id_first_entry_time.get(
+                getattr(r, "job_id", ""), float("inf")
+            ),
+        )
+
+    def prepend_request(self, request: Request) -> None:
+        """Prepend a request to the front of the deque."""
+        self.appendleft(request)
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        """Prepend all requests from another queue."""
+        self.extendleft(requests)
+
+    def remove_request(self, request: Request) -> None:
+        """Remove a specific request from the queue."""
+        self.remove(request)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        """Remove multiple specific requests from the queue."""
+        requests_to_remove = set(requests)
+        filtered = [r for r in self if r not in requests_to_remove]
+        self.clear()
+        self.extend(filtered)
+
+    def __bool__(self) -> bool:
+        """Check if queue has any requests."""
+        return len(self) > 0
+
+    def __len__(self) -> int:
+        """Get number of requests in queue."""
+        return super().__len__()
+
+    def __iter__(self) -> Iterator[Request]:
+        """Iterate over the queue in deque order."""
+        return super().__iter__()
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.CONTINUUM:
+        return ContinuumRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
